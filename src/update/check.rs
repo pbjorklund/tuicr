@@ -2,8 +2,14 @@ use std::time::Duration;
 
 use ureq::Agent;
 
-const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
+use super::source::release_api_url;
+
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RELEASE_URL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {
@@ -25,8 +31,13 @@ pub fn check_for_updates() -> UpdateCheckResult {
         .timeout_global(Some(CHECK_TIMEOUT))
         .build();
     let agent: Agent = config.into();
-    let crates_io_url = crates_io_url();
-    let response = match agent.get(&crates_io_url).call() {
+    let github_release_url = github_release_url();
+    let response = match agent
+        .get(&github_release_url)
+        .header("User-Agent", concat!("tuicr/", env!("CARGO_PKG_VERSION")))
+        .header("Accept", "application/vnd.github+json")
+        .call()
+    {
         Ok(response) => response,
         Err(error) => return UpdateCheckResult::Failed(format!("Network error: {error}")),
     };
@@ -40,12 +51,16 @@ pub fn check_for_updates() -> UpdateCheckResult {
     classify_versions(env!("CARGO_PKG_VERSION"), latest_version(&body))
 }
 
-fn crates_io_url() -> String {
-    format!("{CRATES_IO_API_BASE}/{}", env!("CARGO_PKG_NAME"))
+fn github_release_url() -> String {
+    #[cfg(test)]
+    if let Some(url) = TEST_RELEASE_URL.with(|value| value.borrow().clone()) {
+        return url;
+    }
+    release_api_url(None)
 }
 
 fn latest_version(body: &serde_json::Value) -> Option<&str> {
-    body.get("crate")?.get("max_version")?.as_str()
+    body.get("tag_name")?.as_str()?.strip_prefix('v')
 }
 
 fn classify_versions(current: &str, latest: Option<&str>) -> UpdateCheckResult {
@@ -79,7 +94,34 @@ pub(super) fn is_newer_version(current: &str, latest: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
     use super::*;
+
+    fn github_response(body: &str) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let (request_tx, request_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let bytes_read = stream.read(&mut request).unwrap();
+            request_tx
+                .send(String::from_utf8_lossy(&request[..bytes_read]).into_owned())
+                .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        (format!("http://{address}/releases/latest"), request_rx)
+    }
 
     #[test]
     fn classifies_available_current_and_ahead_versions() {
@@ -117,16 +159,35 @@ mod tests {
     }
 
     #[test]
-    fn builds_crates_io_url_from_package_name() {
+    fn builds_latest_github_release_url_from_package_repository() {
         assert_eq!(
-            crates_io_url(),
-            format!("https://crates.io/api/v1/crates/{}", env!("CARGO_PKG_NAME"))
+            github_release_url(),
+            "https://api.github.com/repos/agavra/tuicr/releases/latest"
         );
     }
 
     #[test]
-    fn reads_latest_version_from_crates_io_shape() {
-        let body = serde_json::json!({"crate": {"max_version": "1.2.3"}});
+    fn checks_github_release_with_required_api_headers() {
+        let (url, request_rx) = github_response(r#"{"tag_name":"v99.0.0"}"#);
+        TEST_RELEASE_URL.with(|value| *value.borrow_mut() = Some(url));
+
+        let result = check_for_updates();
+
+        TEST_RELEASE_URL.with(|value| *value.borrow_mut() = None);
+        assert!(matches!(
+            result,
+            UpdateCheckResult::UpdateAvailable(UpdateInfo { latest_version, .. })
+                if latest_version == "99.0.0"
+        ));
+        let request = request_rx.recv().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /releases/latest http/1.1\r\n"));
+        assert!(request.contains("user-agent: tuicr/"));
+        assert!(request.contains("accept: application/vnd.github+json"));
+    }
+
+    #[test]
+    fn reads_latest_version_from_github_release_shape() {
+        let body = serde_json::json!({"tag_name": "v1.2.3"});
         assert_eq!(latest_version(&body), Some("1.2.3"));
         assert_eq!(latest_version(&serde_json::json!({})), None);
     }

@@ -1,7 +1,6 @@
 mod archive;
 mod executable_swap;
 mod installation;
-mod source;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -16,8 +15,8 @@ use ureq::Agent;
 use self::archive::extract_binary;
 use self::executable_swap::swap_executable;
 use self::installation::{detect_install_method, manager_command};
-use self::source::{release_api_url, release_asset_name, release_asset_url};
 use super::check::is_newer_version;
+use super::source::{release_api_url, release_asset_name, release_asset_url};
 
 pub use self::installation::InstallMethod;
 
@@ -198,29 +197,46 @@ fn update_version_with_runtime(
 fn update_with_optional_version(
     runtime: &impl UpdateRuntime,
     context: UpdateContext,
-    version: Option<&Version>,
+    requested_version: Option<&Version>,
 ) -> Result<UpdateOutcome, UpdateError> {
     let method = context.method;
-    if let Some(version) = version {
-        return match method {
-            InstallMethod::Cargo => {
-                let version = version.to_string();
-                runtime.run_command(
-                    method,
-                    "cargo",
-                    &["install", "tuicr", "--version", &version, "--force"],
-                )?;
-                Ok(UpdateOutcome::ManagerCompleted(method))
-            }
-            InstallMethod::Direct => update_direct(runtime, &context, method, Some(version)),
-            _ => Err(UpdateError::VersionPinUnsupported(method)),
-        };
+    if requested_version.is_some()
+        && !matches!(method, InstallMethod::Cargo | InstallMethod::Direct)
+    {
+        return Err(UpdateError::VersionPinUnsupported(method));
     }
-    if let Some(command) = manager_command(method) {
-        runtime.run_command(method, command.program, command.args)?;
-        return Ok(UpdateOutcome::ManagerCompleted(method));
+
+    let (release, release_version) = fetch_release(runtime, requested_version)?;
+    if !should_install(
+        &context.current_version,
+        &release_version,
+        requested_version,
+    ) {
+        return Ok(UpdateOutcome::UpToDate {
+            method,
+            version: context.current_version,
+        });
     }
-    update_direct(runtime, &context, method, None)
+
+    if matches!(method, InstallMethod::Cargo | InstallMethod::Direct) {
+        let binary_update = install_release_binary(runtime, &context, &release, &release_version);
+        if method == InstallMethod::Cargo
+            && matches!(
+                binary_update,
+                Err(UpdateError::UnsupportedPlatform { .. }
+                    | UpdateError::MissingAsset(_)
+                    | UpdateError::MissingDigest(_))
+            )
+        {
+            return run_cargo_install(runtime, &release_version);
+        }
+        return binary_update;
+    }
+
+    let command =
+        manager_command(method).expect("managed install method must have an update command");
+    runtime.run_command(method, command.program, command.args)?;
+    Ok(UpdateOutcome::ManagerCompleted(method))
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,12 +254,10 @@ struct GitHubAsset {
     digest: Option<String>,
 }
 
-fn update_direct(
+fn fetch_release(
     runtime: &impl UpdateRuntime,
-    context: &UpdateContext,
-    method: InstallMethod,
     requested_version: Option<&Version>,
-) -> Result<UpdateOutcome, UpdateError> {
+) -> Result<(GitHubRelease, Version), UpdateError> {
     let metadata = runtime.fetch(&release_api_url(requested_version))?;
     let release: GitHubRelease = serde_json::from_slice(&metadata)
         .map_err(|error| UpdateError::ReleaseMetadata(error.to_string()))?;
@@ -254,19 +268,26 @@ fn update_direct(
             "requested {requested}, but GitHub returned {release_version}"
         )));
     }
-    let should_install = requested_version.map_or_else(
-        || is_newer_version(&context.current_version, &release_version.to_string()),
-        |requested| {
-            Version::parse(&context.current_version).map_or(true, |current| current != *requested)
-        },
-    );
-    if !should_install {
-        return Ok(UpdateOutcome::UpToDate {
-            method,
-            version: context.current_version.clone(),
-        });
-    }
+    Ok((release, release_version))
+}
 
+fn should_install(
+    current_version: &str,
+    release_version: &Version,
+    requested_version: Option<&Version>,
+) -> bool {
+    requested_version.map_or_else(
+        || is_newer_version(current_version, &release_version.to_string()),
+        |requested| Version::parse(current_version).map_or(true, |current| current != *requested),
+    )
+}
+
+fn install_release_binary(
+    runtime: &impl UpdateRuntime,
+    context: &UpdateContext,
+    release: &GitHubRelease,
+    release_version: &Version,
+) -> Result<UpdateOutcome, UpdateError> {
     let release_version = release_version.to_string();
     let asset_name = release_asset_name(&release_version, &context.os, &context.arch)?;
     let asset = release
@@ -287,10 +308,21 @@ fn update_direct(
     let binary = extract_binary(&asset.name, &archive)?;
     runtime.replace_executable(&context.executable, &binary)?;
     Ok(UpdateOutcome::Updated {
-        method,
+        method: context.method,
         previous_version: context.current_version.clone(),
         new_version: release_version,
     })
+}
+
+fn run_cargo_install(
+    runtime: &impl UpdateRuntime,
+    release_version: &Version,
+) -> Result<UpdateOutcome, UpdateError> {
+    let version = release_version.to_string();
+    let mut args = vec!["install", "tuicr", "--version", &version];
+    args.push("--force");
+    runtime.run_command(InstallMethod::Cargo, "cargo", &args)?;
+    Ok(UpdateOutcome::ManagerCompleted(InstallMethod::Cargo))
 }
 
 fn display_command(program: &str, args: &[&str]) -> String {

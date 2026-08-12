@@ -1,6 +1,6 @@
 use semver::Version;
 
-use super::UpdateError;
+use super::install::UpdateError;
 
 pub(super) fn package_repository_url() -> &'static str {
     env!("CARGO_PKG_REPOSITORY")
