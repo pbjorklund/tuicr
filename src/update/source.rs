@@ -1,6 +1,6 @@
 use semver::Version;
 
-use super::UpdateError;
+use super::install::UpdateError;
 
 pub(super) fn package_repository_url() -> &'static str {
     env!("CARGO_PKG_REPOSITORY")
@@ -8,7 +8,7 @@ pub(super) fn package_repository_url() -> &'static str {
         .trim_end_matches(".git")
 }
 
-pub(in crate::update) fn release_api_url(version: Option<&Version>) -> String {
+pub(super) fn release_api_url(version: Option<&Version>) -> String {
     let repository = package_repository_url()
         .strip_prefix("https://github.com/")
         .expect("package.repository must be an HTTPS github.com URL");

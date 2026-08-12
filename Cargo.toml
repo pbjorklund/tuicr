@@ -59,7 +59,7 @@ sha1 = "0.10"
 # `tuicr update`: stage verified binaries and swap the running executable safely.
 self-replace = "1.5"
 tempfile = "3.24.0"
-# `tuicr update`: compare Cargo release versions using SemVer rules.
+# `tuicr update`: compare GitHub release versions using SemVer rules.
 semver = "1"
 # `tuicr update`: verify GitHub's SHA-256 digest.
 sha2 = "0.10"

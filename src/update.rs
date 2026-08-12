@@ -2,6 +2,7 @@
 
 mod check;
 mod install;
+mod source;
 
 pub use check::{UpdateCheckResult, UpdateInfo, check_for_updates};
 pub use install::{InstallMethod, UpdateError, UpdateOutcome, update_installed, update_to_version};

@@ -2,9 +2,14 @@ use std::time::Duration;
 
 use ureq::Agent;
 
-use super::install::source::release_api_url;
+use super::source::release_api_url;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RELEASE_URL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {
@@ -47,6 +52,10 @@ pub fn check_for_updates() -> UpdateCheckResult {
 }
 
 fn github_release_url() -> String {
+    #[cfg(test)]
+    if let Some(url) = TEST_RELEASE_URL.with(|value| value.borrow().clone()) {
+        return url;
+    }
     release_api_url(None)
 }
 
@@ -85,7 +94,34 @@ pub(super) fn is_newer_version(current: &str, latest: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
     use super::*;
+
+    fn github_response(body: &str) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let (request_tx, request_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let bytes_read = stream.read(&mut request).unwrap();
+            request_tx
+                .send(String::from_utf8_lossy(&request[..bytes_read]).into_owned())
+                .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        (format!("http://{address}/releases/latest"), request_rx)
+    }
 
     #[test]
     fn classifies_available_current_and_ahead_versions() {
@@ -128,6 +164,25 @@ mod tests {
             github_release_url(),
             "https://api.github.com/repos/agavra/tuicr/releases/latest"
         );
+    }
+
+    #[test]
+    fn checks_github_release_with_required_api_headers() {
+        let (url, request_rx) = github_response(r#"{"tag_name":"v99.0.0"}"#);
+        TEST_RELEASE_URL.with(|value| *value.borrow_mut() = Some(url));
+
+        let result = check_for_updates();
+
+        TEST_RELEASE_URL.with(|value| *value.borrow_mut() = None);
+        assert!(matches!(
+            result,
+            UpdateCheckResult::UpdateAvailable(UpdateInfo { latest_version, .. })
+                if latest_version == "99.0.0"
+        ));
+        let request = request_rx.recv().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /releases/latest http/1.1\r\n"));
+        assert!(request.contains("user-agent: tuicr/"));
+        assert!(request.contains("accept: application/vnd.github+json"));
     }
 
     #[test]

@@ -62,12 +62,14 @@ tuicr update
 tuicr update 0.18.0 # Install a known-good version
 ```
 
-`tuicr update` uses Homebrew, Cargo, Mise, or a Nix profile when that manager owns the
-executable. Install-script and manually downloaded binaries update in place from the matching
-GitHub release asset after SHA-256 verification. Exact-version installs support Cargo and direct
-binaries; use the package manager's pinning workflow for Homebrew, Mise, or Nix. A `nix run`
-invocation is temporary rather than installed; rerun it to use the current flake, or use
-`nix profile install github:agavra/tuicr` for an installation that `tuicr update` can upgrade.
+`tuicr update` compares the running version with the latest GitHub release before changing the
+installation. Cargo and direct installs use the matching pre-built release binary after SHA-256
+verification; Cargo compiles from source only when GitHub has no binary for the current platform.
+Homebrew, Mise, and Nix profile installs delegate an available update to their package manager.
+Exact-version installs support Cargo and direct binaries; use the package manager's pinning
+workflow for Homebrew, Mise, or Nix. A `nix run` invocation is temporary rather than installed;
+rerun it to use the current flake, or use `nix profile install github:agavra/tuicr` for an
+installation that `tuicr update` can upgrade.
 
 ## Quick start
 

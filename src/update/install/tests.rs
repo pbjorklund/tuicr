@@ -12,8 +12,8 @@ use zip::write::SimpleFileOptions;
 use super::archive::extract_binary;
 use super::executable_swap::{stage_and_swap, swap_executable};
 use super::installation::{detect_install_method, manager_command};
-use super::source::{package_repository_url, release_asset_name, release_asset_url};
 use super::*;
+use crate::update::source::{package_repository_url, release_asset_name, release_asset_url};
 
 #[derive(Default)]
 struct MockRuntime {
@@ -95,6 +95,20 @@ fn zip_archive(binary_name: &str, contents: &[u8]) -> Vec<u8> {
         .unwrap();
     writer.write_all(contents).unwrap();
     writer.finish().unwrap().into_inner()
+}
+
+fn release_metadata_runtime(version: &str) -> MockRuntime {
+    let metadata = serde_json::json!({
+        "tag_name": format!("v{version}"),
+        "assets": [],
+    });
+    MockRuntime {
+        responses: HashMap::from([(
+            release_api_url(None),
+            serde_json::to_vec(&metadata).unwrap(),
+        )]),
+        ..MockRuntime::default()
+    }
 }
 
 fn direct_runtime(
@@ -207,19 +221,13 @@ fn detects_windows_cargo_mise_and_direct_binary_layouts() {
 }
 
 #[test]
-fn delegates_all_managed_install_methods_to_their_manager() {
+fn delegates_non_cargo_managed_installs_after_comparing_github_release() {
     let cases = [
         (
             "/opt/homebrew/Cellar/tuicr/1.0.0/bin/tuicr",
             InstallMethod::Homebrew,
             "brew",
             vec!["upgrade", "agavra/tap/tuicr"],
-        ),
-        (
-            "/home/alice/.cargo/bin/tuicr",
-            InstallMethod::Cargo,
-            "cargo",
-            vec!["install", "tuicr", "--force"],
         ),
         (
             "/home/alice/.local/share/mise/installs/github-agavra-tuicr/1.0.0/tuicr",
@@ -236,7 +244,7 @@ fn delegates_all_managed_install_methods_to_their_manager() {
     ];
 
     for (path, method, program, args) in cases {
-        let runtime = MockRuntime::default();
+        let runtime = release_metadata_runtime("1.1.0");
         assert_eq!(
             update_with_runtime(&runtime, context(path)).unwrap(),
             UpdateOutcome::ManagerCompleted(method)
@@ -254,10 +262,33 @@ fn delegates_all_managed_install_methods_to_their_manager() {
 }
 
 #[test]
-fn cargo_supports_exact_upgrades_and_rollbacks() {
+fn cargo_prefers_prebuilt_release_binary_without_compiling() {
+    let binary = b"new-cargo-binary";
+    let runtime = direct_runtime("1.1.0", "linux", "x86_64", tar_gz("tuicr", binary), true);
+
+    assert_eq!(
+        update_with_runtime(&runtime, context("/home/alice/.cargo/bin/tuicr")).unwrap(),
+        UpdateOutcome::Updated {
+            method: InstallMethod::Cargo,
+            previous_version: "1.0.0".to_string(),
+            new_version: "1.1.0".to_string(),
+        }
+    );
+    assert_eq!(runtime.replacement.into_inner().unwrap().1, binary);
+    assert!(runtime.commands.into_inner().is_empty());
+}
+
+#[test]
+fn cargo_uses_prebuilt_binaries_for_exact_upgrades_and_rollbacks() {
+    let binary = b"known-good-cargo-binary";
     for version in ["0.9.0", "1.1.0"] {
         let target = semver::Version::parse(version).unwrap();
-        let runtime = MockRuntime::default();
+        let mut runtime = direct_runtime(version, "linux", "x86_64", tar_gz("tuicr", binary), true);
+        let metadata = runtime.responses.remove(&release_api_url(None)).unwrap();
+        runtime
+            .responses
+            .insert(release_api_url(Some(&target)), metadata);
+
         assert_eq!(
             update_version_with_runtime(
                 &runtime,
@@ -265,13 +296,73 @@ fn cargo_supports_exact_upgrades_and_rollbacks() {
                 &target,
             )
             .unwrap(),
+            UpdateOutcome::Updated {
+                method: InstallMethod::Cargo,
+                previous_version: "1.0.0".to_string(),
+                new_version: version.to_string(),
+            }
+        );
+        assert_eq!(runtime.replacement.into_inner().unwrap().1, binary);
+        assert!(runtime.commands.into_inner().is_empty());
+    }
+}
+
+#[test]
+fn cargo_compiles_only_when_a_release_binary_is_unavailable() {
+    for arch in ["x86_64", "riscv64"] {
+        let runtime = release_metadata_runtime("1.1.0");
+        let mut cargo_context = context("/home/alice/.cargo/bin/tuicr");
+        cargo_context.arch = arch.to_string();
+        assert_eq!(
+            update_with_runtime(&runtime, cargo_context).unwrap(),
             UpdateOutcome::ManagerCompleted(InstallMethod::Cargo)
         );
         assert_eq!(
             runtime.commands.into_inner()[0].2,
-            ["install", "tuicr", "--version", version, "--force"]
+            ["install", "tuicr", "--force"]
         );
     }
+
+    let target = semver::Version::parse("0.9.0").unwrap();
+    let mut exact_runtime = release_metadata_runtime("0.9.0");
+    let metadata = exact_runtime
+        .responses
+        .remove(&release_api_url(None))
+        .unwrap();
+    exact_runtime
+        .responses
+        .insert(release_api_url(Some(&target)), metadata);
+    assert_eq!(
+        update_version_with_runtime(
+            &exact_runtime,
+            context("/home/alice/.cargo/bin/tuicr"),
+            &target,
+        )
+        .unwrap(),
+        UpdateOutcome::ManagerCompleted(InstallMethod::Cargo)
+    );
+    assert_eq!(
+        exact_runtime.commands.into_inner()[0].2,
+        ["install", "tuicr", "--version", "0.9.0", "--force"]
+    );
+}
+
+#[test]
+fn cargo_does_not_compile_when_a_release_binary_fails_verification() {
+    let mut runtime = direct_runtime("1.1.0", "linux", "x86_64", tar_gz("tuicr", b"binary"), true);
+    let asset_url = runtime
+        .responses
+        .keys()
+        .find(|url| url.contains("/releases/download/"))
+        .unwrap()
+        .clone();
+    runtime.responses.insert(asset_url, b"tampered".to_vec());
+
+    assert!(matches!(
+        update_with_runtime(&runtime, context("/home/alice/.cargo/bin/tuicr")),
+        Err(UpdateError::Integrity(_))
+    ));
+    assert!(runtime.commands.into_inner().is_empty());
 }
 
 #[test]
@@ -362,13 +453,43 @@ fn exact_direct_install_skips_the_current_version_and_rejects_mismatched_metadat
 }
 
 #[test]
+fn skips_managers_when_github_is_current_or_behind() {
+    for latest in ["1.0.0", "0.9.0"] {
+        for path in [
+            "/opt/homebrew/Cellar/tuicr/1.0.0/bin/tuicr",
+            "/home/alice/.cargo/bin/tuicr",
+            "/home/alice/.local/share/mise/installs/github-agavra-tuicr/1.0.0/tuicr",
+            "/nix/store/hash-tuicr-1.0.0/bin/tuicr",
+        ] {
+            let runtime = release_metadata_runtime(latest);
+            let method = context(path).method;
+            assert_eq!(
+                update_with_runtime(&runtime, context(path)).unwrap(),
+                UpdateOutcome::UpToDate {
+                    method,
+                    version: "1.0.0".to_string(),
+                }
+            );
+            assert!(runtime.commands.into_inner().is_empty());
+            assert!(runtime.replacement.into_inner().is_none());
+        }
+    }
+}
+
+#[test]
 fn returns_manager_failures_without_replacing_the_binary() {
-    let runtime = MockRuntime {
-        command_error: Some("upgrade failed".to_string()),
-        ..MockRuntime::default()
-    };
-    let error = update_with_runtime(&runtime, context("/home/alice/.cargo/bin/tuicr")).unwrap_err();
-    assert!(error.to_string().contains("Cargo could not update tuicr"));
+    let mut runtime = release_metadata_runtime("1.1.0");
+    runtime.command_error = Some("upgrade failed".to_string());
+    let error = update_with_runtime(
+        &runtime,
+        context("/opt/homebrew/Cellar/tuicr/1.0.0/bin/tuicr"),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Homebrew could not update tuicr")
+    );
     assert!(runtime.replacement.into_inner().is_none());
 }
 
