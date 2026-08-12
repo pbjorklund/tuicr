@@ -319,7 +319,7 @@ fn cargo_compiles_only_when_a_release_binary_is_unavailable() {
         );
         assert_eq!(
             runtime.commands.into_inner()[0].2,
-            ["install", "tuicr", "--force"]
+            ["install", "tuicr", "--version", "1.1.0", "--force"]
         );
     }
 
@@ -344,6 +344,26 @@ fn cargo_compiles_only_when_a_release_binary_is_unavailable() {
     assert_eq!(
         exact_runtime.commands.into_inner()[0].2,
         ["install", "tuicr", "--version", "0.9.0", "--force"]
+    );
+}
+
+#[test]
+fn cargo_compiles_when_the_release_binary_has_no_verifiable_digest() {
+    let runtime = direct_runtime(
+        "1.1.0",
+        "linux",
+        "x86_64",
+        tar_gz("tuicr", b"binary"),
+        false,
+    );
+
+    assert_eq!(
+        update_with_runtime(&runtime, context("/home/alice/.cargo/bin/tuicr")).unwrap(),
+        UpdateOutcome::ManagerCompleted(InstallMethod::Cargo)
+    );
+    assert_eq!(
+        runtime.commands.into_inner()[0].2,
+        ["install", "tuicr", "--version", "1.1.0", "--force"]
     );
 }
 

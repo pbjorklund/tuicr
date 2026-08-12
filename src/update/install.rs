@@ -223,10 +223,12 @@ fn update_with_optional_version(
         if method == InstallMethod::Cargo
             && matches!(
                 binary_update,
-                Err(UpdateError::UnsupportedPlatform { .. } | UpdateError::MissingAsset(_))
+                Err(UpdateError::UnsupportedPlatform { .. }
+                    | UpdateError::MissingAsset(_)
+                    | UpdateError::MissingDigest(_))
             )
         {
-            return run_cargo_install(runtime, requested_version);
+            return run_cargo_install(runtime, &release_version);
         }
         return binary_update;
     }
@@ -314,13 +316,10 @@ fn install_release_binary(
 
 fn run_cargo_install(
     runtime: &impl UpdateRuntime,
-    requested_version: Option<&Version>,
+    release_version: &Version,
 ) -> Result<UpdateOutcome, UpdateError> {
-    let version = requested_version.map(ToString::to_string);
-    let mut args = vec!["install", "tuicr"];
-    if let Some(version) = version.as_deref() {
-        args.extend(["--version", version]);
-    }
+    let version = release_version.to_string();
+    let mut args = vec!["install", "tuicr", "--version", &version];
     args.push("--force");
     runtime.run_command(InstallMethod::Cargo, "cargo", &args)?;
     Ok(UpdateOutcome::ManagerCompleted(InstallMethod::Cargo))
