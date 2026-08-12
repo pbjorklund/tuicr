@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use ureq::Agent;
 
-const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
+use super::install::source::release_api_url;
+
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
@@ -25,8 +26,13 @@ pub fn check_for_updates() -> UpdateCheckResult {
         .timeout_global(Some(CHECK_TIMEOUT))
         .build();
     let agent: Agent = config.into();
-    let crates_io_url = crates_io_url();
-    let response = match agent.get(&crates_io_url).call() {
+    let github_release_url = github_release_url();
+    let response = match agent
+        .get(&github_release_url)
+        .header("User-Agent", concat!("tuicr/", env!("CARGO_PKG_VERSION")))
+        .header("Accept", "application/vnd.github+json")
+        .call()
+    {
         Ok(response) => response,
         Err(error) => return UpdateCheckResult::Failed(format!("Network error: {error}")),
     };
@@ -40,12 +46,12 @@ pub fn check_for_updates() -> UpdateCheckResult {
     classify_versions(env!("CARGO_PKG_VERSION"), latest_version(&body))
 }
 
-fn crates_io_url() -> String {
-    format!("{CRATES_IO_API_BASE}/{}", env!("CARGO_PKG_NAME"))
+fn github_release_url() -> String {
+    release_api_url(None)
 }
 
 fn latest_version(body: &serde_json::Value) -> Option<&str> {
-    body.get("crate")?.get("max_version")?.as_str()
+    body.get("tag_name")?.as_str()?.strip_prefix('v')
 }
 
 fn classify_versions(current: &str, latest: Option<&str>) -> UpdateCheckResult {
@@ -117,16 +123,16 @@ mod tests {
     }
 
     #[test]
-    fn builds_crates_io_url_from_package_name() {
+    fn builds_latest_github_release_url_from_package_repository() {
         assert_eq!(
-            crates_io_url(),
-            format!("https://crates.io/api/v1/crates/{}", env!("CARGO_PKG_NAME"))
+            github_release_url(),
+            "https://api.github.com/repos/agavra/tuicr/releases/latest"
         );
     }
 
     #[test]
-    fn reads_latest_version_from_crates_io_shape() {
-        let body = serde_json::json!({"crate": {"max_version": "1.2.3"}});
+    fn reads_latest_version_from_github_release_shape() {
+        let body = serde_json::json!({"tag_name": "v1.2.3"});
         assert_eq!(latest_version(&body), Some("1.2.3"));
         assert_eq!(latest_version(&serde_json::json!({})), None);
     }

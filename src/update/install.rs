@@ -1,7 +1,7 @@
 mod archive;
 mod executable_swap;
 mod installation;
-mod source;
+pub(super) mod source;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
